@@ -16,8 +16,13 @@ from flash_head.utils.utils import match_and_blend_colors_torch, resize_and_cent
 from flash_head.utils.facecrop import process_image
 
 # compile models to speedup inference
-COMPILE_MODEL = True
-COMPILE_VAE = True
+# First run on Windows can take a while (CPU compiling kernels); later runs are cached.
+# Disable with FLASHHEAD_COMPILE=0 if needed.
+_compile_enabled = os.environ.get("FLASHHEAD_COMPILE", "1") == "1"
+COMPILE_MODEL = _compile_enabled
+# VAE compile recompiles on every new HxW and can stall decode for ~1min; off by default.
+# Enable explicitly with FLASHHEAD_COMPILE_VAE=1 if you only use a fixed resolution.
+COMPILE_VAE = os.environ.get("FLASHHEAD_COMPILE_VAE", "0") == "1"
 # use parallel vae to speedup decode/encode, only support WanVAE
 USE_PARALLEL_VAE = True
 
@@ -278,7 +283,7 @@ class FlashHeadPipeline:
                 torch.cuda.synchronize()
                 end_time = time.time()
                 if self.rank == 0:
-                    print(f'[generate] model denoise per step: {end_time - start_time}s')
+                    logger.debug(f'[generate] model denoise per step: {end_time - start_time}s')
 
             noise[:, :self.latent_motion_frames.shape[1]] = self.latent_motion_frames
 
@@ -290,7 +295,7 @@ class FlashHeadPipeline:
             torch.cuda.synchronize()
             end_decode_time = time.time()
             if self.rank == 0:
-                print(f'[generate] decode video frames: {end_decode_time - start_decode_time}s')
+                logger.debug(f'[generate] decode video frames: {end_decode_time - start_decode_time}s')
         
         torch.cuda.synchronize()
         start_color_correction_time = time.time()
@@ -301,7 +306,7 @@ class FlashHeadPipeline:
         torch.cuda.synchronize()
         end_color_correction_time = time.time()
         if self.rank == 0:
-            print(f'[generate] color correction: {end_color_correction_time - start_color_correction_time}s')
+            logger.debug(f'[generate] color correction: {end_color_correction_time - start_color_correction_time}s')
 
         torch.cuda.synchronize()
         start_encode_time = time.time()
@@ -309,7 +314,7 @@ class FlashHeadPipeline:
         torch.cuda.synchronize()
         end_encode_time = time.time()
         if self.rank == 0:
-            print(f'[generate] encode motion frames: {end_encode_time - start_encode_time}s')
+            logger.debug(f'[generate] encode motion frames: {end_encode_time - start_encode_time}s')
 
         gen_video_samples = videos #[:, :, self.motion_frames_num:]
 

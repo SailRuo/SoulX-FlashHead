@@ -2,6 +2,7 @@
 import yaml
 import torch
 import copy
+from typing import Optional
 from loguru import logger
 
 from flash_head.src.pipeline.flash_head_pipeline import FlashHeadPipeline
@@ -36,10 +37,19 @@ def get_pipeline(world_size, ckpt_dir, model_type, wav2vec_dir):
         infer_params['sample_steps'] = 4
     return pipeline
 
-def get_base_data(pipeline, cond_image_path_or_dir, base_seed, use_face_crop):
+def get_base_data(
+    pipeline,
+    cond_image_path_or_dir,
+    base_seed,
+    use_face_crop,
+    height: Optional[int] = None,
+    width: Optional[int] = None,
+):
+    h = int(height) if height is not None else int(infer_params["height"])
+    w = int(width) if width is not None else int(infer_params["width"])
     pipeline.prepare_params(
         cond_image_path_or_dir=cond_image_path_or_dir,
-        target_size=(infer_params['height'], infer_params['width']),
+        target_size=(h, w),
         frame_num=infer_params['frame_num'],
         motion_frames_num=infer_params['motion_frames_num'],
         sampling_steps=infer_params['sample_steps'],

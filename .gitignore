@@ -7,5 +7,7 @@ examples/
 sample_results/
 gradio_results/
 gradio_results_multigpu/
+stream_pcm_results/
+stream_uploads/
 models/
 tools/

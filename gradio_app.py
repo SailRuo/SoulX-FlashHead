@@ -321,17 +321,17 @@ with gr.Blocks(title="SoulX-FlashHead Video Generator", theme=gr.themes.Soft()) 
                         model_type_input = gr.Dropdown(
                             label="FlashHead Model Type", 
                             choices=[
-                                ("Pro Version (Multi-GPU Support)", "pro"),
-                                ("Lite Version (Single GPU Only)", "lite")
+                                ("Lite Version (Single GPU Only)", "lite"),
+                                ("Pro Version (Multi-GPU Support)", "pro")
                             ],
-                            value="pro",
-                            info="Select the model variant. 'pro' supports both single and multi-GPU, 'lite' is single GPU only."
+                            value="lite",
+                            info="Lite: best for single-GPU realtime. Pro: higher quality, needs multi-GPU for realtime."
                         )
                         mode_input = gr.Radio(
                             choices=["Single GPU", "Multi-GPU"],
                             value="Single GPU",
                             label="Execution Mode",
-                            visible=True,
+                            visible=False,
                             info="Single GPU: Keeps model in memory for fast interactive use. Multi-GPU: Spawns new process, better for stability/isolation."
                         )
                         gpu_ids_input = gr.Textbox(
