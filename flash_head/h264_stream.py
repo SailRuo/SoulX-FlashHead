@@ -1,8 +1,8 @@
 """
 Encode RGB frame batches to H.264 for low-latency WS streaming.
 
-Wire format for mobile: short self-contained MP4 (frag moov) — Android WebView
-can decode via <video>, unlike raw Annex-B + WebCodecs.
+Wire format for mobile: short progressive MP4 (+faststart) — Android WebView
+can decode via <video>. Fragmented empty_moov often yields frame-rate=0 on MTK.
 
 Encoder: libx264 ultrafast by default; FLASHHEAD_H264_ENCODER=nvenc for NVENC.
 """
@@ -118,9 +118,15 @@ def encode_frames_mp4(
     crf: int = 26,
 ) -> bytes:
     """
-    frames: (T,H,W,3) uint8 RGB → fragmented MP4 (H.264, no audio).
-    Mobile-friendly: starts with moov, decodable by HTML <video>.
+    frames: (T,H,W,3) uint8 RGB → progressive MP4 (H.264, no audio).
+
+    Uses a temp file + ``+faststart`` so ``moov`` precedes ``mdat``.
+    Fragmented empty_moov clips often open on Android MTK WebView with
+    frame-rate=0 and never paint — phone looks frozen on the avatar.
     """
+    import tempfile
+    from pathlib import Path
+
     frames, t, h, w = _prepare_frames(frames)
     enc = _resolve_encoder()
     if not enc or not _FFMPEG:
@@ -128,52 +134,61 @@ def encode_frames_mp4(
 
     fps_i = max(1, int(fps))
     crf_i = int(np.clip(crf, 16, 40))
-    cmd = [
-        _FFMPEG,
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-f",
-        "rawvideo",
-        "-pix_fmt",
-        "rgb24",
-        "-s",
-        f"{w}x{h}",
-        "-r",
-        str(fps_i),
-        "-i",
-        "pipe:0",
-        "-an",
-        "-c:v",
-        enc,
-        *_encoder_args(enc, crf_i, t),
-        "-pix_fmt",
-        "yuv420p",
-        "-f",
-        "mp4",
-        "-movflags",
-        "frag_keyframe+empty_moov+default_base_moof",
-        "pipe:1",
-    ]
-    raw = frames.tobytes()
+    tmp_path = ""
     try:
-        proc = subprocess.run(
-            cmd,
-            input=raw,
-            capture_output=True,
-            timeout=max(8.0, t * 0.5),
-            check=False,
-        )
-    except subprocess.TimeoutExpired as e:
-        raise RuntimeError("ffmpeg H.264/mp4 encode timed out") from e
-    if proc.returncode != 0 or not proc.stdout:
-        err = (proc.stderr or b"").decode("utf-8", errors="replace")[-400:]
-        raise RuntimeError(f"ffmpeg mp4 encode failed rc={proc.returncode}: {err}")
-    if proc.stdout[:4] != b"\x00\x00\x00" and b"ftyp" not in proc.stdout[:64]:
-        # fragmented mp4 still usually starts with size+ftyp or styp
-        if b"ftyp" not in proc.stdout[:128] and b"styp" not in proc.stdout[:128] and b"moof" not in proc.stdout[:128]:
-            raise RuntimeError("ffmpeg mp4 output missing ftyp/moof")
-    return proc.stdout
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+            tmp_path = tmp.name
+        cmd = [
+            _FFMPEG,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-s",
+            f"{w}x{h}",
+            "-r",
+            str(fps_i),
+            "-i",
+            "pipe:0",
+            "-an",
+            "-c:v",
+            enc,
+            *_encoder_args(enc, crf_i, t),
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            "-y",
+            tmp_path,
+        ]
+        raw = frames.tobytes()
+        try:
+            proc = subprocess.run(
+                cmd,
+                input=raw,
+                capture_output=True,
+                timeout=max(8.0, t * 0.5),
+                check=False,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError("ffmpeg H.264/mp4 encode timed out") from e
+        if proc.returncode != 0:
+            err = (proc.stderr or b"").decode("utf-8", errors="replace")[-400:]
+            raise RuntimeError(f"ffmpeg mp4 encode failed rc={proc.returncode}: {err}")
+        data = Path(tmp_path).read_bytes()
+        if not data or (b"ftyp" not in data[:128] and b"moov" not in data[:4096]):
+            raise RuntimeError("ffmpeg mp4 output missing ftyp/moov")
+        logger.info(f"mp4 faststart {w}x{h} frames={t} bytes={len(data)}")
+        return data
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 def encode_frames_annexb(

@@ -133,7 +133,9 @@ Server 校验后保存到 `stream_uploads/`，回复：
   "seed": 9999,
   "use_face_crop": false,
   "save_dir": "stream_pcm_results",
-  "save_mp4": true
+  "save_mp4": true,
+  "sampling_steps": 4,
+  "color_correction_strength": 1.0
 }
 ```
 
@@ -151,6 +153,8 @@ Server 校验后保存到 `stream_uploads/`，回复：
 | `enhance_model` | 否 | `animevideov3-x2` | 实时：`animevideov3-x2` / `x4fast`；画质：`x4plus` |
 | `enhance_out_long_side` | 否 | `1024` | 超分后目标最长边（512→1024≈2×） |
 | `send_mp4_binary` | 否 | `true` | 仅 `mp4`：meta 后是否紧跟 mp4 二进制 |
+| `sampling_steps` | 否 | `4` | `4` 为默认画质；`2` 为极速档，约减半扩散去噪时间，但口型/细节稳定性会下降 |
+| `color_correction_strength` | 否 | `1.0` | 0–1；设为 `0` 可关闭色彩校正并略降延迟 |
 | 其它 | 否 | 见上 | 权重路径、种子等 |
 
 ### 画质增强（Real-ESRGAN，推荐 lite + 超分）

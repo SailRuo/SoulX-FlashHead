@@ -115,15 +115,18 @@ class EnhanceConfig:
     """NCNN tile size; 0 = auto."""
     tile: int = 0
     gpuid: int = 0
+    """Run Real-ESRGAN every Nth frame; in-betweens are blended. 1 = all frames."""
+    stride: int = 2
 
 
 class FrameEnhancer:
-    """Process one FrameBatch's RGB frames. Thread-safe for single-session use."""
+    """Process one FrameBatch's RGB frames. Thread-safe for multi-worker NCNN."""
 
     def __init__(self, config: EnhanceConfig):
         self.config = config
         self._backend = "off"
-        self._ncnn: Any = None
+        self._ncnn_pool: list[Any] = []
+        self._worker_locks: list[threading.Lock] = []
         self._lock = threading.Lock()
         self._model_scale = 2
         if not config.enabled:
@@ -154,6 +157,8 @@ class FrameEnhancer:
             "enhance_backend": self._backend if self.config.enabled else "off",
             "enhance_model": self.config.model,
             "enhance_out_long_side": int(self.config.out_long_side),
+            "enhance_workers": len(self._ncnn_pool) if self._ncnn_pool else 1,
+            "enhance_stride": int(getattr(self.config, "stride", 1) or 1),
         }
 
     def _try_init_ncnn(self) -> bool:
@@ -175,22 +180,37 @@ class FrameEnhancer:
         model_id = NCNN_MODELS.get(model_key, 0)
         scale_by_id = {0: 2, 1: 3, 2: 4, 3: 4, 4: 4}
         self._model_scale = scale_by_id.get(model_id, 2)
+        # Default 1 worker: FlashHead CUDA + NCNN Vulkan share one GPU; 2 workers
+        # make denoise steps jump ~52ms → 200–400ms under overlap.
         try:
-            self._ncnn = Realesrgan(
-                gpuid=int(self.config.gpuid),
-                tta_mode=False,
-                tilesize=int(self.config.tile or 0),
-                model=int(model_id),
-            )
+            workers = int(os.environ.get("FLASHHEAD_ENHANCE_WORKERS", "1") or "1")
+        except ValueError:
+            workers = 1
+        workers = max(1, min(4, workers))
+        pool: list[Any] = []
+        try:
+            for i in range(workers):
+                pool.append(
+                    Realesrgan(
+                        gpuid=int(self.config.gpuid),
+                        tta_mode=False,
+                        tilesize=int(self.config.tile or 0),
+                        model=int(model_id),
+                    )
+                )
+            self._ncnn_pool = pool
+            self._worker_locks = [threading.Lock() for _ in pool]
             self._backend = "ncnn"
             logger.info(
                 f"FrameEnhancer backend=ncnn model={model_key}(id={model_id}) "
-                f"scale={self._model_scale} out_long_side={self.config.out_long_side}"
+                f"scale={self._model_scale} out_long_side={self.config.out_long_side} "
+                f"workers={workers} stride={max(1, int(self.config.stride or 1))}"
             )
             return True
         except Exception as e:
             logger.warning(f"failed to init realesrgan-ncnn-py: {e}")
-            self._ncnn = None
+            self._ncnn_pool = []
+            self._worker_locks = []
             return False
 
     def enhance_frames(self, frames: np.ndarray) -> np.ndarray:
@@ -202,21 +222,53 @@ class FrameEnhancer:
             return frames
         if frames.ndim != 4 or frames.shape[-1] != 3:
             raise ValueError(f"expected (T,H,W,3) RGB, got {frames.shape}")
-        with self._lock:
-            if self._backend == "ncnn":
-                return self._enhance_ncnn(frames)
-            return self._enhance_opencv(frames)
+        if self._backend == "ncnn":
+            return self._enhance_ncnn(frames)
+        return self._enhance_opencv(frames)
+
+    def _key_indices(self, t: int) -> list[int]:
+        stride = max(1, int(self.config.stride or 1))
+        if stride <= 1 or t <= 2:
+            return list(range(t))
+        keys = list(range(0, t, stride))
+        if keys[-1] != t - 1:
+            keys.append(t - 1)
+        return keys
+
+    def _fill_stride_gaps(self, out: np.ndarray, keys: list[int]) -> None:
+        """Linear-blend missing frames between enhanced keyframes (in-place)."""
+        t = out.shape[0]
+        if len(keys) >= t:
+            return
+        key_set = set(keys)
+        for i in range(t):
+            if i in key_set:
+                continue
+            # find surrounding keys
+            prev_k = keys[0]
+            next_k = keys[-1]
+            for k in keys:
+                if k <= i:
+                    prev_k = k
+                if k >= i:
+                    next_k = k
+                    break
+            if next_k == prev_k:
+                out[i] = out[prev_k]
+                continue
+            a = float(i - prev_k) / float(next_k - prev_k)
+            # int blend is fine for speech; avoids float alloc churn
+            out[i] = (
+                out[prev_k].astype(np.float32) * (1.0 - a)
+                + out[next_k].astype(np.float32) * a
+            ).astype(np.uint8)
 
     def _target_size(self, h: int, w: int) -> tuple[int, int]:
         """Compute output (nh, nw) from out_long_side or native model scale."""
         out_long = int(self.config.out_long_side or 0)
         if out_long > 0:
             long = max(h, w)
-            if long >= out_long:
-                # already large enough — light sharpen only path uses same size
-                scale = float(out_long) / float(long)
-            else:
-                scale = float(out_long) / float(long)
+            scale = float(out_long) / float(long)
             nw = max(16, int(round(w * scale)) // 2 * 2)
             nh = max(16, int(round(h * scale)) // 2 * 2)
             return nh, nw
@@ -226,56 +278,83 @@ class FrameEnhancer:
         nh = max(16, int(round(h * s)) // 2 * 2)
         return nh, nw
 
-    def _enhance_ncnn(self, frames: np.ndarray) -> np.ndarray:
+    def _one_ncnn_frame(
+        self,
+        worker_idx: int,
+        rgb: np.ndarray,
+        nh: int,
+        nw: int,
+    ) -> np.ndarray:
         import cv2
 
-        t, h, w, _ = frames.shape
-        nh, nw = self._target_size(h, w)
-        out = np.empty((t, nh, nw, 3), dtype=np.uint8)
-        fails: list[tuple[int, Exception]] = []
-        with _silence_native_stdio_locked():
-            for i in range(t):
-                # ncnn wrapper expects BGR numpy / bytes via process_cv2 or process_pil
-                bgr = frames[i][:, :, ::-1].copy()
+        ncnn = self._ncnn_pool[worker_idx]
+        lock = self._worker_locks[worker_idx]
+        with lock:
+            with _silence_native_stdio_locked():
+                bgr = rgb[:, :, ::-1].copy()
                 try:
-                    if hasattr(self._ncnn, "process_cv2"):
-                        up = self._ncnn.process_cv2(bgr)
+                    if hasattr(ncnn, "process_cv2"):
+                        up = ncnn.process_cv2(bgr)
                     else:
                         from PIL import Image
 
-                        pil = Image.fromarray(frames[i])
-                        up_pil = self._ncnn.process_pil(pil)
-                        # process_pil returns RGB
+                        pil = Image.fromarray(rgb)
+                        up_pil = ncnn.process_pil(pil)
                         up_rgb = np.asarray(up_pil)
                         if up_rgb.shape[0] != nh or up_rgb.shape[1] != nw:
                             up_rgb = cv2.resize(up_rgb, (nw, nh), interpolation=cv2.INTER_AREA)
-                        out[i] = up_rgb
-                        continue
+                        return up_rgb
                 except Exception as e:
-                    fails.append((i, e))
-                    out[i] = self._one_opencv(frames[i], nh, nw)
-                    continue
+                    logger.warning(f"ncnn enhance frame failed: {e}; opencv fallback")
+                    return self._one_opencv(rgb, nh, nw)
 
-                # process_cv2 returns BGR
                 if up is None:
-                    out[i] = self._one_opencv(frames[i], nh, nw)
-                    continue
+                    return self._one_opencv(rgb, nh, nw)
                 up_rgb = up[:, :, ::-1]
                 if up_rgb.shape[0] != nh or up_rgb.shape[1] != nw:
                     interp = cv2.INTER_AREA if (up_rgb.shape[0] > nh) else cv2.INTER_LANCZOS4
                     up_rgb = cv2.resize(up_rgb, (nw, nh), interpolation=interp)
-                out[i] = up_rgb
-        for i, e in fails:
-            logger.warning(f"ncnn enhance frame {i} failed: {e}; opencv fallback")
+                return up_rgb
+
+    def _enhance_ncnn(self, frames: np.ndarray) -> np.ndarray:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import time as _time
+
+        t, h, w, _ = frames.shape
+        nh, nw = self._target_size(h, w)
+        out = np.empty((t, nh, nw, 3), dtype=np.uint8)
+        keys = self._key_indices(t)
+        n_workers = max(1, len(self._ncnn_pool))
+        t0 = _time.time()
+        if len(keys) == 1 or n_workers == 1:
+            for i in keys:
+                out[i] = self._one_ncnn_frame(0, frames[i], nh, nw)
+        else:
+            with ThreadPoolExecutor(max_workers=min(n_workers, len(keys))) as ex:
+                futs = {
+                    ex.submit(
+                        self._one_ncnn_frame, j % n_workers, frames[i], nh, nw
+                    ): i
+                    for j, i in enumerate(keys)
+                }
+                for fut in as_completed(futs):
+                    i = futs[fut]
+                    out[i] = fut.result()
+        self._fill_stride_gaps(out, keys)
+        logger.info(
+            f"ncnn enhance T={t} keys={len(keys)}/{t} stride={max(1, int(self.config.stride or 1))} "
+            f"{w}x{h}->{nw}x{nh} workers={n_workers} cost={_time.time() - t0:.3f}s"
+        )
         return out
 
     def _enhance_opencv(self, frames: np.ndarray) -> np.ndarray:
         t, h, w, _ = frames.shape
         nh, nw = self._target_size(h, w)
-        # If out_long_side == native and equal size, still sharpen
         out = np.empty((t, nh, nw, 3), dtype=np.uint8)
-        for i in range(t):
+        keys = self._key_indices(t)
+        for i in keys:
             out[i] = self._one_opencv(frames[i], nh, nw)
+        self._fill_stride_gaps(out, keys)
         return out
 
     @staticmethod
@@ -317,6 +396,14 @@ def parse_enhance_config(msg: dict) -> EnhanceConfig:
         gpuid_i = int(gpuid if gpuid is not None else 0)
     except (TypeError, ValueError):
         gpuid_i = 0
+    # Default stride=2 from env; client may override via enhance_stride.
+    env_stride = os.environ.get("FLASHHEAD_ENHANCE_STRIDE", "4")
+    raw_stride = msg.get("enhance_stride", nested.get("stride", env_stride))
+    try:
+        stride_i = int(raw_stride if raw_stride is not None else 4)
+    except (TypeError, ValueError):
+        stride_i = 4
+    stride_i = max(1, min(8, stride_i))
     return EnhanceConfig(
         enabled=enabled,
         backend=backend,
@@ -324,6 +411,7 @@ def parse_enhance_config(msg: dict) -> EnhanceConfig:
         out_long_side=out_long_side,
         tile=tile_i,
         gpuid=gpuid_i,
+        stride=stride_i,
     )
 
 

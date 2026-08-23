@@ -22,6 +22,7 @@ import asyncio
 import json
 import os
 import re
+import time
 from datetime import datetime
 from io import BytesIO
 from typing import Any, Dict, Literal, Optional
@@ -31,6 +32,7 @@ from loguru import logger
 from PIL import Image
 import numpy as np
 from websockets.asyncio.server import ServerConnection, serve
+from websockets.exceptions import ConnectionClosed
 
 from flash_head.pcm_stream import (
     FlashHeadPCMSession,
@@ -101,6 +103,10 @@ def _session_info(session: FlashHeadPCMSession) -> Dict[str, Any]:
         "height": int(getattr(session, "out_height", 512)),
         "width": int(getattr(session, "out_width", 512)),
         "max_long_side": int(getattr(session, "max_long_side", 1024)),
+        "sampling_steps": int(getattr(session, "sampling_steps", 4)),
+        "color_correction_strength": float(
+            getattr(session, "color_correction_strength", 1.0)
+        ),
         "timeline_pts": float(getattr(session, "_timeline_pts", 0.0)),
         "segment_seconds": (
             session.chunk_samples / session.model_sample_rate
@@ -176,6 +182,7 @@ async def _emit_videos(
         if send_mp4_binary and chunk.video_path and os.path.exists(chunk.video_path):
             with open(chunk.video_path, "rb") as f:
                 mp4_bytes = f.read()
+        t_send = time.perf_counter()
         await _send_json(
             ws,
             _video_meta(
@@ -188,6 +195,10 @@ async def _emit_videos(
         )
         if mp4_bytes is not None:
             await _send_bytes(ws, mp4_bytes, lock)
+        logger.info(
+            f"WS send video#{chunk.chunk_idx} bytes={len(mp4_bytes or b'')} "
+            f"cost={time.perf_counter() - t_send:.3f}s"
+        )
 
 
 def _pack_frame_batch_binary(
@@ -378,8 +389,13 @@ async def _emit_frame_batches(
             meta["subtitle"] = subtitle
             if subtitle_id:
                 meta["subtitle_id"] = subtitle_id
+        t_send = time.perf_counter()
         await _send_json(ws, meta, lock)
         await _send_bytes(ws, payload, lock)
+        logger.info(
+            f"WS send frame_batch#{batch.chunk_idx} bytes={len(payload)} "
+            f"cost={time.perf_counter() - t_send:.3f}s"
+        )
 
 
 async def _emit_stream_items(
@@ -579,6 +595,21 @@ async def handle_connection(ws: ServerConnection) -> None:
                     await sj({"type": "error", "error": "session already flushed/closed"})
                     continue
                 try:
+                    # FlashHead CUDA + NCNN Vulkan share one GPU. Overlapping NCNN
+                    # pack with the next generate makes denoise 52ms→400ms/step.
+                    # OpenCV Lanczos does not touch the GPU — keep overlap.
+                    if (
+                        enhancer is not None
+                        and getattr(enhancer, "active", False)
+                        and getattr(enhancer, "backend", "") == "ncnn"
+                        and emit_task is not None
+                    ):
+                        try:
+                            await emit_task
+                        except asyncio.CancelledError:
+                            pass
+                        except Exception:
+                            logger.exception("await previous enhance/pack failed")
                     cancel_at = int(getattr(session, "_cancel_gen", 0))
                     items = await asyncio.to_thread(session.feed_pcm_bytes, message, fmt)
                     # Barge-in may have landed while this GPU chunk was running.
@@ -689,12 +720,13 @@ async def handle_connection(ws: ServerConnection) -> None:
                     stream_max_long_side = None
                 enhancer = create_enhancer(enhance_cfg)
 
+                # Prefer H.264/fMP4 for frames mode when client asks (or default h264).
                 raw_codec = str(
                     msg.get("frame_video_codec")
                     or msg.get("video_codec")
-                    or "jpeg"
+                    or "h264"
                 ).strip().lower()
-                if raw_codec in ("h264", "avc", "h.264"):
+                if raw_codec in ("h264", "avc", "h.264", "mp4"):
                     video_codec = "h264"
                 else:
                     video_codec = "jpeg"
@@ -736,6 +768,12 @@ async def handle_connection(ws: ServerConnection) -> None:
                     kwargs["height"] = int(msg["height"])
                 if msg.get("width") is not None:
                     kwargs["width"] = int(msg["width"])
+                if msg.get("sampling_steps") is not None:
+                    kwargs["sampling_steps"] = int(msg["sampling_steps"])
+                if msg.get("color_correction_strength") is not None:
+                    kwargs["color_correction_strength"] = float(
+                        msg["color_correction_strength"]
+                    )
                 await sj({"type": "loading", "message": "loading model..."})
                 try:
                     session = await asyncio.to_thread(FlashHeadPCMSession, **kwargs)
@@ -814,7 +852,10 @@ async def handle_connection(ws: ServerConnection) -> None:
                         cancel_gen = int(session.cancel_pending())
                     except Exception as e:
                         logger.exception("cancel_pending failed")
-                        await sj({"type": "error", "error": f"cancel failed: {e}"})
+                        try:
+                            await sj({"type": "error", "error": f"cancel failed: {e}"})
+                        except ConnectionClosed:
+                            break
                         continue
                     # Snap UI back to the processed FlashHead reference frame.
                     try:
@@ -822,21 +863,29 @@ async def handle_connection(ws: ServerConnection) -> None:
                         if ref is not None:
                             _queue_emit([ref])
                             await _drain_emit()
+                    except ConnectionClosed:
+                        logger.info(f"WS closed during cancel final_ref peer={peer}")
+                        break
                     except Exception:
                         logger.exception("final_ref after cancel failed")
                 logger.info(f"WS cancel/interrupt gen={cancel_gen} peer={peer}")
-                await sj(
-                    {
-                        "type": "cancelled",
-                        "cancel_gen": cancel_gen,
-                        "final_ref": True,
-                        **(
-                            _session_info(session)
-                            if session is not None and not session._closed
-                            else {}
-                        ),
-                    }
-                )
+                try:
+                    await sj(
+                        {
+                            "type": "cancelled",
+                            "cancel_gen": cancel_gen,
+                            "final_ref": True,
+                            **(
+                                _session_info(session)
+                                if session is not None and not session._closed
+                                else {}
+                            ),
+                        }
+                    )
+                except ConnectionClosed:
+                    # Hangup often races cancel + TCP close — not an application error.
+                    logger.info(f"WS closed while sending cancelled peer={peer}")
+                    break
                 continue
 
             if mtype == "flush":
@@ -845,10 +894,28 @@ async def handle_connection(ws: ServerConnection) -> None:
                     continue
                 pad_silence = bool(msg.get("pad_silence", True))
                 try:
-                    items = await asyncio.to_thread(session.flush, pad_silence)
-                    if items:
-                        _queue_emit(items)
-                    await _drain_emit()
+                    # Emit one micro at a time so the phone can resume between
+                    # generates — batching the whole flush froze the last frame
+                    # for seconds under opencv enhance.
+                    first_pad = pad_silence
+                    while True:
+                        item = await asyncio.to_thread(session.flush_next, first_pad)
+                        first_pad = False
+                        if item is None:
+                            break
+                        _queue_emit([item])
+                        await _drain_emit()
+                    if getattr(session, "stream_mode", "") == "mp4":
+                        rem = await asyncio.to_thread(session._emit_segment)
+                        if rem is not None:
+                            _queue_emit([rem])
+                            await _drain_emit()
+                    else:
+                        ref = await asyncio.to_thread(session.make_final_ref_batch)
+                        if ref is not None:
+                            _queue_emit([ref])
+                            await _drain_emit()
+                    session._closed = True
                     await sj(
                         {
                             "type": "done",
@@ -861,19 +928,31 @@ async def handle_connection(ws: ServerConnection) -> None:
                     enhancer = None
                     current_subtitle = ""
                     current_subtitle_id = ""
+                except ConnectionClosed:
+                    logger.info(f"WS closed during flush peer={peer}")
+                    break
                 except Exception as e:
                     logger.exception("flush failed")
-                    await sj({"type": "error", "error": str(e)})
+                    try:
+                        await sj({"type": "error", "error": str(e)})
+                    except ConnectionClosed:
+                        break
                     session = None
                     enhancer = None
                 continue
 
             if mtype == "close":
-                await _drain_emit()
-                await sj({"type": "bye"})
+                try:
+                    await _drain_emit()
+                    await sj({"type": "bye"})
+                except ConnectionClosed:
+                    pass
                 break
 
             await sj({"type": "error", "error": f"unknown type: {mtype}"})
+    except ConnectionClosed as e:
+        # Browser/WebView hangup often uses 1005 (no status) — normal disconnect.
+        logger.info(f"WS closed OK peer={peer} code={e.code} reason={e.reason!r}")
     except Exception as e:
         logger.exception(f"WS connection error: {e}")
     finally:

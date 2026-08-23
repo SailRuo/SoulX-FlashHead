@@ -23,6 +23,10 @@ COMPILE_MODEL = _compile_enabled
 # VAE compile recompiles on every new HxW and can stall decode for ~1min; off by default.
 # Enable explicitly with FLASHHEAD_COMPILE_VAE=1 if you only use a fixed resolution.
 COMPILE_VAE = os.environ.get("FLASHHEAD_COMPILE_VAE", "0") == "1"
+# Per-stage CUDA synchronization is useful for profiling, but it forces the CPU
+# to wait between every denoise step and adds avoidable scheduling overhead in
+# the realtime server.  The PCM layer already records end-to-end timings.
+PROFILE_GENERATE_STAGES = os.environ.get("FLASHHEAD_PROFILE_STAGES", "0") == "1"
 # use parallel vae to speedup decode/encode, only support WanVAE
 USE_PARALLEL_VAE = True
 
@@ -233,6 +237,7 @@ class FlashHeadPipeline:
     @torch.no_grad()
     def generate(self, audio_embedding):
         # evaluation mode
+        profile_stages = PROFILE_GENERATE_STAGES and self.rank == 0
         with torch.no_grad():
 
             # sample videos
@@ -246,8 +251,9 @@ class FlashHeadPipeline:
                 generator=self.generator)
 
             for i in range(len(self.timesteps)-1):
-                torch.cuda.synchronize()
-                start_time = time.time()
+                if profile_stages:
+                    torch.cuda.synchronize()
+                    start_time = time.perf_counter()
 
                 noise[:, :self.latent_motion_frames.shape[1]] = self.latent_motion_frames
 
@@ -280,40 +286,43 @@ class FlashHeadPipeline:
 
                     noise = (1 - t_i_1) * x_0 + t_i_1 * torch.randn(x_0.size(), dtype=x_0.dtype, device=self.device, generator=self.generator)
 
-                torch.cuda.synchronize()
-                end_time = time.time()
-                if self.rank == 0:
+                if profile_stages:
+                    torch.cuda.synchronize()
+                    end_time = time.perf_counter()
                     logger.debug(f'[generate] model denoise per step: {end_time - start_time}s')
 
             noise[:, :self.latent_motion_frames.shape[1]] = self.latent_motion_frames
 
-            torch.cuda.synchronize()
-            start_decode_time = time.time()
+            if profile_stages:
+                torch.cuda.synchronize()
+                start_decode_time = time.perf_counter()
 
             videos = self.vae.decode(noise)
 
-            torch.cuda.synchronize()
-            end_decode_time = time.time()
-            if self.rank == 0:
+            if profile_stages:
+                torch.cuda.synchronize()
+                end_decode_time = time.perf_counter()
                 logger.debug(f'[generate] decode video frames: {end_decode_time - start_decode_time}s')
         
-        torch.cuda.synchronize()
-        start_color_correction_time = time.time()
+        if profile_stages:
+            torch.cuda.synchronize()
+            start_color_correction_time = time.perf_counter()
         if self.color_correction_strength > 0.0:
             videos = match_and_blend_colors_torch(videos, self.original_color_reference, self.color_correction_strength)
 
         cond_frame = videos[:, :, -self.motion_frames_num:].to(self.device)
-        torch.cuda.synchronize()
-        end_color_correction_time = time.time()
-        if self.rank == 0:
+        if profile_stages:
+            torch.cuda.synchronize()
+            end_color_correction_time = time.perf_counter()
             logger.debug(f'[generate] color correction: {end_color_correction_time - start_color_correction_time}s')
 
-        torch.cuda.synchronize()
-        start_encode_time = time.time()
+        if profile_stages:
+            torch.cuda.synchronize()
+            start_encode_time = time.perf_counter()
         self.latent_motion_frames = self.vae.encode(cond_frame)
-        torch.cuda.synchronize()
-        end_encode_time = time.time()
-        if self.rank == 0:
+        if profile_stages:
+            torch.cuda.synchronize()
+            end_encode_time = time.perf_counter()
             logger.debug(f'[generate] encode motion frames: {end_encode_time - start_encode_time}s')
 
         gen_video_samples = videos #[:, :, self.motion_frames_num:]

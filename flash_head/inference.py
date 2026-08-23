@@ -44,18 +44,26 @@ def get_base_data(
     use_face_crop,
     height: Optional[int] = None,
     width: Optional[int] = None,
+    sampling_steps: Optional[int] = None,
+    color_correction_strength: Optional[float] = None,
 ):
     h = int(height) if height is not None else int(infer_params["height"])
     w = int(width) if width is not None else int(infer_params["width"])
+    steps = int(sampling_steps) if sampling_steps is not None else int(infer_params["sample_steps"])
+    color_strength = (
+        float(color_correction_strength)
+        if color_correction_strength is not None
+        else float(infer_params["color_correction_strength"])
+    )
     pipeline.prepare_params(
         cond_image_path_or_dir=cond_image_path_or_dir,
         target_size=(h, w),
         frame_num=infer_params['frame_num'],
         motion_frames_num=infer_params['motion_frames_num'],
-        sampling_steps=infer_params['sample_steps'],
+        sampling_steps=steps,
         seed=base_seed,
         shift=infer_params['sample_shift'],
-        color_correction_strength=infer_params['color_correction_strength'],
+        color_correction_strength=color_strength,
         use_face_crop=use_face_crop,
     )
 
@@ -84,4 +92,3 @@ def run_pipeline(pipeline, audio_embedding):
     sample = pipeline.generate(audio_embedding)
     sample_frames = (((sample+1)/2).permute(1,2,3,0).clip(0,1) * 255).contiguous()
     return sample_frames
-

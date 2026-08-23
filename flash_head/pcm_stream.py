@@ -15,10 +15,9 @@ import os
 import subprocess
 import time
 import wave
-from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Deque, List, Optional, Sequence, Union
+from typing import List, Optional, Sequence, Union
 
 import imageio
 import librosa
@@ -126,8 +125,8 @@ def resolve_output_size(
 
 # Shared pipelines across sessions (Gradio-style). Keyed by (ckpt, model_type, wav2vec).
 _PIPELINE_CACHE: dict[tuple[str, str, str], object] = {}
-# (height, width, model_type) already compiled/warmed for generate().
-_WARMED_SIZES: set[tuple[int, int, str]] = set()
+# (height, width, model_type, sampling_steps) already warmed for generate().
+_WARMED_SIZES: set[tuple[int, int, str, int]] = set()
 
 
 def _pipeline_cache_key(ckpt_dir: str, model_type: str, wav2vec_dir: str) -> tuple[str, str, str]:
@@ -216,7 +215,7 @@ def warmup_pipeline(
         h = int(getattr(pipeline, "target_h", 512))
         w = int(getattr(pipeline, "target_w", 512))
         mt = str(getattr(pipeline, "model_type", "lite")).lower()
-        _WARMED_SIZES.add((h, w, mt))
+        _WARMED_SIZES.add((h, w, mt, int(params["sample_steps"])))
     except Exception:
         pass
 
@@ -470,6 +469,8 @@ class FlashHeadPCMSession:
         height: Optional[int] = None,
         width: Optional[int] = None,
         max_long_side: int = 1024,
+        sampling_steps: Optional[int] = None,
+        color_correction_strength: Optional[float] = None,
     ):
         input_sr = int(sample_rate)
         if input_sr <= 0:
@@ -495,6 +496,20 @@ class FlashHeadPCMSession:
         self.session_id = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
         self.aspect_ratio = (aspect_ratio or "1:1").strip()
         self.max_long_side = max(256, int(max_long_side))
+        params = get_infer_params()
+        default_steps = int(params["sample_steps"])
+        self.sampling_steps = int(sampling_steps) if sampling_steps is not None else default_steps
+        if self.sampling_steps not in (2, 4):
+            raise ValueError("sampling_steps must be 2 or 4")
+        default_color = float(params["color_correction_strength"])
+        self.color_correction_strength = (
+            float(color_correction_strength)
+            if color_correction_strength is not None
+            else default_color
+        )
+        self.color_correction_strength = float(
+            np.clip(self.color_correction_strength, 0.0, 1.0)
+        )
         self.out_height, self.out_width = resolve_output_size(
             aspect_ratio=aspect_ratio,
             height=height,
@@ -515,9 +530,10 @@ class FlashHeadPCMSession:
             use_face_crop=use_face_crop,
             height=self.out_height,
             width=self.out_width,
+            sampling_steps=self.sampling_steps,
+            color_correction_strength=self.color_correction_strength,
         )
 
-        params = get_infer_params()
         if int(params["sample_rate"]) != MODEL_SAMPLE_RATE:
             raise ValueError(
                 f"Unexpected model sample_rate in infer_params: {params['sample_rate']}"
@@ -540,8 +556,11 @@ class FlashHeadPCMSession:
         self.audio_start_idx = self.audio_end_idx - self.frame_num
 
         self._pcm_buf = np.zeros((0,), dtype=np.float32)  # buffered at input_sample_rate
-        self._audio_dq: Deque[float] = deque(
-            [0.0] * self.cached_audio_length_sum, maxlen=self.cached_audio_length_sum
+        # Keep the model audio history as a fixed NumPy buffer.  The old deque
+        # path converted every 16k PCM chunk to a Python list and then rebuilt a
+        # NumPy array, creating tens of thousands of Python objects per chunk.
+        self._audio_buf = np.zeros(
+            (self.cached_audio_length_sum,), dtype=np.float32
         )
         self._micro_idx = 0
         self._segment_idx = 0
@@ -564,6 +583,8 @@ class FlashHeadPCMSession:
             f"input_sr={self.input_sample_rate} model_sr={self.model_sample_rate} "
             f"input_chunk_samples={self.input_chunk_samples} "
             f"model_chunk_samples={self.chunk_samples} "
+            f"sampling_steps={self.sampling_steps} "
+            f"color_correction={self.color_correction_strength:g} "
             f"(~{self.chunk_samples / self.model_sample_rate:.3f}s) fps={self.fps} "
             f"first_segment_chunks={self.first_segment_chunks} "
             f"chunks_per_segment={self.chunks_per_segment} "
@@ -747,33 +768,42 @@ class FlashHeadPCMSession:
             is_final_ref=True,
         )
 
+    def flush_next(self, pad_silence: bool = False) -> Optional[StreamItem]:
+        """Generate at most one remaining micro-chunk. Used by WS to emit
+        mid-flush so the client can resume instead of freezing until all
+        trailing PCM is generated (enhance makes that multi-second)."""
+        if self._closed:
+            return None
+        if self._pcm_buf.shape[0] > 0 and self._pcm_buf.shape[0] < self.input_chunk_samples:
+            if pad_silence:
+                pad = self.input_chunk_samples - self._pcm_buf.shape[0]
+                self._pcm_buf = np.concatenate(
+                    [self._pcm_buf, np.zeros((pad,), dtype=np.float32)]
+                )
+            else:
+                return None
+        if self._pcm_buf.shape[0] < self.input_chunk_samples:
+            return None
+        chunk_in = self._pcm_buf[: self.input_chunk_samples]
+        self._pcm_buf = self._pcm_buf[self.input_chunk_samples :]
+        chunk_16k = _fit_length(
+            _resample_to_model_rate(chunk_in, self.input_sample_rate),
+            self.chunk_samples,
+        )
+        return self._generate_micro_chunk(chunk_16k)
+
     def flush(self, pad_silence: bool = True) -> List[StreamItem]:
         """Flush remaining PCM. Pads with silence to a full chunk if pad_silence=True."""
         if self._closed:
             return []
         out: List[StreamItem] = []
-        if self._pcm_buf.shape[0] > 0:
-            if self._pcm_buf.shape[0] < self.input_chunk_samples:
-                if pad_silence:
-                    pad = self.input_chunk_samples - self._pcm_buf.shape[0]
-                    self._pcm_buf = np.concatenate(
-                        [self._pcm_buf, np.zeros((pad,), dtype=np.float32)]
-                    )
-                else:
-                    logger.warning(
-                        f"Dropping {self._pcm_buf.shape[0]} trailing input samples (< one chunk)"
-                    )
-                    self._pcm_buf = np.zeros((0,), dtype=np.float32)
-            while self._pcm_buf.shape[0] >= self.input_chunk_samples:
-                chunk_in = self._pcm_buf[: self.input_chunk_samples]
-                self._pcm_buf = self._pcm_buf[self.input_chunk_samples :]
-                chunk_16k = _fit_length(
-                    _resample_to_model_rate(chunk_in, self.input_sample_rate),
-                    self.chunk_samples,
-                )
-                item = self._generate_micro_chunk(chunk_16k)
-                if item is not None:
-                    out.append(item)
+        first = True
+        while True:
+            item = self.flush_next(pad_silence=pad_silence and first)
+            first = False
+            if item is None:
+                break
+            out.append(item)
 
         if self.stream_mode == "mp4":
             rem = self._emit_segment()
@@ -792,13 +822,18 @@ class FlashHeadPCMSession:
         Run one silent generate at this session's HxW so torch.compile finishes
         before the client starts streaming. Returns True if a warm run executed.
         """
-        key = (int(self.out_height), int(self.out_width), str(self.model_type).lower())
+        key = (
+            int(self.out_height),
+            int(self.out_width),
+            str(self.model_type).lower(),
+            int(self.sampling_steps),
+        )
         if key in _WARMED_SIZES:
             logger.info(f"Skip warm: {key[0]}x{key[1]} already warmed")
             return False
 
         logger.info(
-            f"Warming resolution {key[0]}x{key[1]} "
+            f"Warming resolution {key[0]}x{key[1]} steps={key[3]} "
             f"(torch.compile first time at this size can take 1–2 minutes) ..."
         )
         audio_array = np.zeros((self.cached_audio_length_sum,), dtype=np.float32)
@@ -870,26 +905,46 @@ class FlashHeadPCMSession:
         return item
 
     def _generate_micro_chunk(self, chunk_pcm_16k: np.ndarray) -> Optional[StreamItem]:
-        self._audio_dq.extend(chunk_pcm_16k.tolist())
-        audio_array = np.asarray(self._audio_dq, dtype=np.float32)
+        chunk_pcm_16k = np.ascontiguousarray(chunk_pcm_16k, dtype=np.float32).reshape(-1)
+        history_len = int(self._audio_buf.shape[0])
+        n_new = int(chunk_pcm_16k.shape[0])
+        if n_new >= history_len:
+            # Match deque(maxlen=...) semantics: retain the most recent samples.
+            self._audio_buf[:] = chunk_pcm_16k[-history_len:]
+        elif n_new > 0:
+            self._audio_buf[:-n_new] = self._audio_buf[n_new:]
+            self._audio_buf[-n_new:] = chunk_pcm_16k
+
+        t_total = time.perf_counter()
+        t_audio = time.perf_counter()
         audio_embedding = get_audio_embedding(
             self.pipeline,
-            audio_array,
+            self._audio_buf,
             self.audio_start_idx,
             self.audio_end_idx,
         )
-
         torch.cuda.synchronize()
-        t0 = time.time()
+        audio_elapsed = time.perf_counter() - t_audio
+
+        t_infer = time.perf_counter()
         video = run_pipeline(self.pipeline, audio_embedding)
         video = video[self.motion_frames_num :]
         torch.cuda.synchronize()
-        elapsed = time.time() - t0
+        elapsed = time.perf_counter() - t_infer
 
+        t_download = time.perf_counter()
         frames = video.detach().cpu().numpy().astype(np.uint8)
+        download_elapsed = time.perf_counter() - t_download
+        total_elapsed = time.perf_counter() - t_total
         audio = np.asarray(chunk_pcm_16k, dtype=np.float32).reshape(-1)
         idx = self._micro_idx
         self._micro_idx += 1
+
+        logger.info(
+            f"PCM timing micro-{idx} audio_embed={audio_elapsed:.3f}s "
+            f"gpu_infer={elapsed:.3f}s d2h={download_elapsed:.3f}s "
+            f"total={total_elapsed:.3f}s"
+        )
 
         if self.stream_mode == "frames":
             pts0 = float(self._timeline_pts)
