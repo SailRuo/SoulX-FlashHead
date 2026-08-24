@@ -16,6 +16,9 @@ import os
 import sys
 
 
+_SOURCED_PACKAGES = ("yunchang", "sageattention")
+
+
 def _seed_source_for_package(pkg_name: str) -> None:
     _MEIPASS = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
     root = os.path.join(_MEIPASS, pkg_name)
@@ -47,4 +50,5 @@ def _seed_source_for_package(pkg_name: str) -> None:
                 linecache.cache[key] = (len(full), None, lines, full)
 
 
-_seed_source_for_package("yunchang")
+for _pkg in _SOURCED_PACKAGES:
+    _seed_source_for_package(_pkg)

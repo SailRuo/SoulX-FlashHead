@@ -1,4 +1,6 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+import os
+import sys
 import yaml
 import torch
 import copy
@@ -8,7 +10,34 @@ from loguru import logger
 from flash_head.src.pipeline.flash_head_pipeline import FlashHeadPipeline
 from flash_head.src.distributed.usp_device import get_device, get_parallel_degree
 
-with open("flash_head/configs/infer_params.yaml", "r") as f:
+
+def _config_path(name: str) -> str:
+    """Locate a config file robustly for both source runs and PyInstaller onedir.
+
+    PyInstaller bundles `flash_head/configs/` under sys._MEIPASS (i.e. `_internal`);
+    plain relative paths break at runtime because the launcher sets the process CWD
+    next to the exe, not at the project root.
+    """
+    candidates = [
+        # frozen: modules live in _MEIPASS, configs materialised under it
+        os.path.join(getattr(sys, "_MEIPASS", ""), "flash_head", "configs", name),
+        # source: this file is at <root>/flash_head/inference.py
+        os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "flash_head", "configs", name,
+        ),
+        # cwd fallback
+        os.path.join("flash_head", "configs", name),
+    ]
+    for p in candidates:
+        if p and os.path.isfile(p):
+            return p
+    raise FileNotFoundError(
+        f"Could not locate flash_head/configs/{name}; tried: {candidates}"
+    )
+
+
+with open(_config_path("infer_params.yaml"), "r") as f:
     infer_params = yaml.safe_load(f)
 
 def get_pipeline(world_size, ckpt_dir, model_type, wav2vec_dir):

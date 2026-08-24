@@ -133,10 +133,6 @@ except Exception as exc:
     print(f'[WARN] collect_dynamic_libs(torchvision): {exc}')
 
 # ---- nvidia vendor bits (use only valid Python identifiers) -------
-# NOTE: 'triton' is intentionally EXCLUDED. The app never imports it, but torch._dynamo
-# calls has_triton_package() at import time; an incomplete bundled triton copy crashes
-# (triton.backends discovery needs real .py files on disk that PyInstaller omits).
-# Excluding it lets has_triton_package() return False cleanly.
 for _vendor in ('nvidia',):
     try:
         hiddenimports.extend(_as_str_list(collect_submodules(_vendor)))
@@ -150,6 +146,42 @@ for _vendor in ('nvidia',):
         binaries.extend(_as_pair_list(collect_dynamic_libs(_vendor)))
     except Exception:
         pass
+
+# ---- triton: MUST be included (torch._inductor needs it for CUDA compiles) ----
+# FlashHead uses @torch.compile -> torch._inductor -> Triton kernel backend. Without
+# a working triton the warmup forward raises TritonMissing. The official
+# hook-triton.py keeps triton's source on disk and collects the backend files, which
+# is exactly what fixes the original "triton/backends/amd/compiler.py missing" crash
+# (that crash was due to triton modules being bundled into PYZ without their .py).
+try:
+    hiddenimports.extend(_as_str_list(collect_submodules('triton')))
+    hiddenimports.extend(_as_str_list(collect_submodules('triton.backends')))
+    hiddenimports.extend(_as_str_list(collect_submodules('triton.backends.amd')))
+    binaries.extend(_as_pair_list(collect_dynamic_libs('triton')))
+    print('[INFO] triton modules + backends collected')
+except Exception as exc:
+    print(f'[WARN] collect triton: {exc.__class__.__name__}: {exc}')
+
+# triton also reads NON-.py files at runtime to compile CUDA kernels: backends'
+# driver.c, include/*.h, libdevice*.bc, bin/ptxas(.exe), cuda.lib, etc. These are
+# excluded by collect_data_files()'s default suffix filter, so walk the whole package
+# tree and add every non-.pyc file as data to be safe.
+try:
+    import importlib.util as _ilu
+    _tspec = _ilu.find_spec('triton')
+    _tpath = _tspec.submodule_search_locations[0]
+    for _dp, _dn, _fn in os.walk(_tpath):
+        if '__pycache__' in _dp.split(os.sep):
+            continue
+        for _f in _fn:
+            if _f.endswith('.pyc'):
+                continue
+            _src = os.path.join(_dp, _f)
+            _rel = os.path.relpath(_src, os.path.dirname(_tpath))
+            datas.append((_src, os.path.dirname(_rel)))
+    print('[INFO] triton package tree added as data (driver.c/.h/.bc/exe/etc)')
+except Exception as exc:
+    print(f'[WARN] triton data walk: {exc.__class__.__name__}: {exc}')
 
 # ---- realesrgan-ncnn-py optional -------------------------------------------
 for _opt in ('realesrgan_ncnn_py',):
@@ -188,6 +220,17 @@ try:
     print('[INFO] yunchang modules + source collected')
 except Exception as exc:
     print(f'[WARN] collect yunchang: {exc.__class__.__name__}: {exc}')
+
+# ---- sageattention: source must be on disk for @triton.jit -----------------
+# sageattention/triton/*.py decorate kernels with @triton.jit, which reads the
+# function source via inspect.getsourcelines(). Same PYZ-source problem as yunchang:
+# materialise the .py to disk so the runtime hook can seed linecache for it too.
+try:
+    binaries.extend(_as_pair_list(collect_dynamic_libs('sageattention')))
+    datas.extend(_as_pair_list(collect_data_files('sageattention', include_py_files=True)))
+    print('[INFO] sageattention source collected to disk')
+except Exception as exc:
+    print(f'[WARN] collect sageattention: {exc.__class__.__name__}: {exc}')
 
 RTH = os.path.join(PROJECT_ROOT, 'flashhead_rt_hook_torch_source.py')
 
@@ -257,14 +300,13 @@ a = Analysis(
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
-    hookspath=[],
+    hookspath=[os.path.join(PROJECT_ROOT, 'pyi_hooks')],
     hooksconfig={},
     runtime_hooks=[RTH],
     excludes=[
         'tkinter',
         'test',
         'tests',
-        'triton',
     ],
     noarchive=False,
     optimize=0,

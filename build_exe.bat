@@ -122,7 +122,35 @@ if exist "%ROOT%flash_head\configs" (
     )
 )
 
-REM --- 10) Write deploy note so user knows models/ must be placed next to exe ---
+REM --- 10) Bundle the model weights so the shipped folder is self-contained -----
+set "HAVE_MODEL="
+if exist "%ROOT%models\SoulX-FlashHead-1_3B\Model_Lite\diffusion_pytorch_model.safetensors" set "HAVE_MODEL=1"
+if not defined HAVE_MODEL goto :NO_MODELS
+if exist "%ROOT%dist\FlashHead_PCM_Server\models\SoulX-FlashHead-1_3B\" goto :MODELS_PRESENT
+
+echo [INFO] Bundling models\ into dist\FlashHead_PCM_Server\models\ ...
+xcopy /e /i /h /y "%ROOT%models" "%ROOT%dist\FlashHead_PCM_Server\models" >nul
+if errorlevel 1 goto :MODELS_COPY_FAILED
+echo [INFO] Models bundled into the dist folder (portable).
+goto :AFTER_MODELS
+
+:MODELS_COPY_FAILED
+echo [ERROR] Failed to copy models\ into the dist folder - see above.
+call :PAUSE_OR_EXIT 1
+exit /b 1
+
+:MODELS_PRESENT
+echo [INFO] models\ already present in dist folder - skipping copy.
+goto :AFTER_MODELS
+
+:NO_MODELS
+echo [WARN] models\SoulX-FlashHead-1_3B\Model_Lite\diffusion_pytorch_model.safetensors not found.
+echo        The shipped folder will NOT include model weights - the PCM server will
+echo        fail to load a model unless --ckpt_dir / --wav2vec_dir are supplied.
+
+:AFTER_MODELS
+
+REM --- 11) Write deploy note so user knows models/ must be placed next to exe ---
 (
 echo SoulX-FlashHead - Deploy Notes (onedir build, PCM Server)
 echo ==========================================================
@@ -131,12 +159,13 @@ echo 2. Requirements on target machine:
 echo    - NVIDIA GPU with CUDA 12.x compatible driver (4090 / 5090 recommended)
 echo    - At least 16 GB VRAM for Lite model, 24 GB+ for Pro model
 echo    - 64 GB RAM or more recommended
-echo 3. Put model weights next to this .txt, directory layout:
-echo    models\
-echo      SoulX-FlashHead-1_3B\
-echo        Model_Lite\   diffusion_pytorch_model.safetensors ...
-echo        Model_Pro\    diffusion_pytorch_model.safetensors ...
-echo      wav2vec2-base-960h\  config.json, preprocessor_config.json, model.safetensors ...
+echo 3. Model weights are BUNDLED in this folder under models\ (self-contained).
+echo    Layout:
+echo      models\
+echo        SoulX-FlashHead-1_3B\
+echo          Model_Lite\   diffusion_pytorch_model.safetensors ...
+echo          Model_Pro\    diffusion_pytorch_model.safetensors ...
+echo        wav2vec2-base-960h\  config.json, preprocessor_config.json, model.safetensors ...
 echo 4. Start: double-click Launch_PCM_Server.bat
 echo    URL: ws://0.0.0.0:8765/ws   (use this PC's IP for LAN phones)
 echo 5. If the window closes instantly: re-run Launch_PCM_Server.bat from a CMD
@@ -149,8 +178,8 @@ echo  BUILD SUCCESS (PCM Server only)
 echo  Output: %ROOT%dist\FlashHead_PCM_Server\
 echo ============================================
 echo.
-echo IMPORTANT: Before shipping, copy your models\ folder next to the exe.
-echo            See DEPLOY_NOTES.txt in the dist folder.
+echo Model weights are bundled inside the output folder (self-contained).
+echo To ship, copy the whole FlashHead_PCM_Server folder. See DEPLOY_NOTES.txt.
 echo.
 call :PAUSE_OR_EXIT 0
 endlocal

@@ -35,7 +35,10 @@ if not defined MODELS_DIR (
 
 set "CUDA_VISIBLE_DEVICES=0"
 set "PYTHONUNBUFFERED=1"
-if not defined FLASHHEAD_COMPILE set "FLASHHEAD_COMPILE=1"
+REM torch.compile in a frozen exe would need a full MSVC+SDK+CUDA+Python header
+REM toolchain at runtime (triton JIT), which is not portable -> use eager mode.
+REM Set FLASHHEAD_COMPILE explicitly (1=compile will fail without dev toolchain).
+set "FLASHHEAD_COMPILE=0"
 
 echo ============================================
 echo  SoulX-FlashHead PCM WebSocket API
