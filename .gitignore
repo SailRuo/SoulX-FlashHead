@@ -11,3 +11,6 @@ stream_pcm_results/
 stream_uploads/
 models/
 tools/
+build/
+dist/
+build_exe.log
